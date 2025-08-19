@@ -1,239 +1,238 @@
-import os
+# streamlit_app.py
+# OmArtificial Gains – Fair-Use Friendly Build
+# - Manual refresh button (no background polling)
+# - Cached data fetches via src/data/quotes.py@get_quotes
+# - Optional gentle auto-refresh (OFF by default)
+# - Lite mode to keep Community Cloud usage low
+
+from __future__ import annotations
+
+import math
+from datetime import datetime, timedelta
+from typing import List, Sequence, Optional
+
 import pandas as pd
-import numpy as np
 import streamlit as st
-import altair as alt
 
-from src.data.quotes import (
-    get_quote_summary,
-    simple_dcf_intrinsic_value,
-    rsi,  # for RSI series chart
-    get_profitability_flags,
-)
-from src.data.ownership import fetch_institutional_snapshot
-from src.nlp.sentiment import compute_weighted_sentiment
-from src.score.scoring import normalize_mos, technical_score, ownership_score, overall_score
-
-st.set_page_config(page_title="OmArtificial Gains — Scorecard", page_icon="📈", layout="wide")
-
-# ---------------- Sidebar Controls ----------------
-st.sidebar.title("OmArtificial Gains")
-ticker = st.sidebar.text_input("Ticker", value="CLOV").strip().upper()
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("DCF Assumptions")
-years = st.sidebar.slider("Projection years", 3, 10, 5, 1)
-growth_rate = st.sidebar.slider("FCF growth rate", 0.00, 0.30, 0.10, 0.01)
-discount_rate = st.sidebar.slider("Discount rate (WACC)", 0.05, 0.20, 0.11, 0.005)
-terminal_growth = st.sidebar.slider("Terminal growth", 0.00, 0.04, 0.02, 0.005)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Buy Signal Filters")
-mos_threshold = st.sidebar.slider("Margin of Safety threshold", 0.05, 0.50, 0.25, 0.05)
-rsi_buy_max = st.sidebar.slider("Max RSI for fresh entry", 40, 80, 65, 1)
-
-st.sidebar.markdown("---")
-user_text = st.sidebar.text_area("(Optional) Paste latest earnings transcript or summary for NLP sentiment", height=140)
-
-st.sidebar.markdown("---")
-if st.sidebar.button("Refresh Data", use_container_width=True):
-    st.rerun()
-
-if not ticker:
-    st.stop()
-
-# ---------------- Data Fetch ----------------
-quote = get_quote_summary(ticker)
-price = quote.get("price")
-sma200 = quote.get("sma200")
-rsi14 = quote.get("rsi14")
-
-dcf = simple_dcf_intrinsic_value(
-    ticker=ticker,
-    fcf0=None,
-    shares_outstanding=quote.get("shares_outstanding"),
-    years=years,
-    growth_rate=growth_rate,
-    discount_rate=discount_rate,
-    terminal_growth=terminal_growth,
+# ----------------------------
+# App Config & Header
+# ----------------------------
+st.set_page_config(
+    page_title="OmArtificial Gains",
+    page_icon="📈",
+    layout="wide",
 )
 
-own = fetch_institutional_snapshot(ticker)
+st.title("OmArtificial Gains 📈")
+st.caption(
+    "Fair-use friendly build. Data is cached and refreshed on demand to avoid Streamlit Cloud 403 blocks."
+)
 
-# ---------------- NLP Sentiment ----------------
-if user_text and user_text.strip():
-    sent = compute_weighted_sentiment(user_text)
-else:
-    sent = {"score": 0.0, "label": "neutral", "hits": []}
+# ----------------------------
+# Sidebar: Core Inputs
+# ----------------------------
+st.sidebar.header("Configuration")
 
-# ---------------- Profitability Flags ----------------
-prof = get_profitability_flags(ticker)
+tickers_input = st.sidebar.text_input(
+    "Tickers (comma-separated)",
+    value="AAPL, MSFT, NVDA",
+    help="Example: AAPL, MSFT, NVDA",
+)
 
-# ---------------- Scorecard Metrics ----------------
-iv_ps = dcf.get("iv_per_share") if dcf.get("ok") else None
-mos = None
-if iv_ps and price and iv_ps > 0:
-    mos = (iv_ps - price) / iv_ps
+lite_mode = st.sidebar.toggle(
+    "Lite mode (recommended on Streamlit Cloud)",
+    value=True,
+    help="Skips non-essential network work."
+)
 
-mos_norm = normalize_mos(mos if mos is not None else 0.0)
-tech_norm = technical_score(price, sma200, rsi14)
-own_norm = ownership_score(own.get("qoq_change"), own.get("top10_pct"))
-sent_norm = float(sent.get("score", 0.0))
+# ----------------------------
+# Sidebar: Refresh Controls
+# ----------------------------
+st.sidebar.subheader("Data refresh")
 
-score = overall_score(mos_norm, sent_norm, tech_norm, own_norm)
+refresh_now = st.sidebar.button("Fetch latest data")
+st.sidebar.caption("Tip: Data is cached ~15 minutes in Community Cloud friendly mode.")
 
-# ---------------- Layout ----------------
-st.title("📊 OmArtificial Gains — Company Scorecard")
-st.caption("DCF + Technicals + NLP Sentiment + Institutional Ownership")
+auto_refresh = st.sidebar.toggle("Auto-refresh (advanced)", value=False)
+interval_min = st.sidebar.slider(
+    "Auto-refresh interval (minutes)",
+    min_value=10, max_value=60, value=15,
+    disabled=not auto_refresh
+)
 
-# KPIs
-kpi_cols = st.columns(5)
-kpi_cols[0].metric("Price", f"{price:.2f}" if price is not None else "—")
-kpi_cols[1].metric("Intrinsic Value (DCF)", f"{iv_ps:.2f}" if iv_ps is not None else "—", help=dcf.get("message", ""))
-kpi_cols[2].metric("Margin of Safety", f"{mos*100:.1f}%" if mos is not None else "—")
-kpi_cols[3].metric("RSI(14)", f"{rsi14:.1f}" if rsi14 is not None else "—")
-kpi_cols[4].metric("Overall Score", f"{score:.0f}/100")
+# ----------------------------
+# Utilities / Session State
+# ----------------------------
+if "quotes_df" not in st.session_state:
+    st.session_state.quotes_df = None
+    st.session_state.last_fetch_utc = None
 
-# Core Profitability Check (your 3 favorites)
-st.markdown("### ✅ Core Profitability Check")
-pc1, pc2, pc3, pc4 = st.columns([1.2, 1.2, 1.2, 3.4])
-pc1.metric("Net Profitability", "Yes" if prof["net_profit"] else "No")
-pc2.metric("Free Cash Flow +", "Yes" if prof["fcf_positive"] else "No")
-pc3.metric("Operating Cash Flow +", "Yes" if prof["ocf_positive"] else "No")
-with pc4:
-    vals = prof.get("values", {})
-    st.caption(
-        f"Net Income (TTM/Annual): {vals.get('net_income_ttm_or_annual'):,}" if vals.get("net_income_ttm_or_annual") is not None else "Net Income: —"
-    )
-    st.caption(
-        f"OCF (TTM): {vals.get('ocf_ttm'):,}" if vals.get("ocf_ttm") is not None else "OCF (TTM): —"
-    )
-    st.caption(
-        f"FCF (TTM): {vals.get('fcf_ttm'):,}" if vals.get('fcf_ttm') is not None else "FCF (TTM): —"
-    )
+def parse_tickers(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [t.strip().upper() for t in raw.split(",") if t.strip()]
 
-# Buy signal
-buy_signal = False
-buy_reasons = []
-if iv_ps and price and mos is not None and mos >= mos_threshold:
-    buy_signal = True
-    buy_reasons.append(f"MOS ≥ {int(mos_threshold*100)}%")
-if price and sma200 and price >= sma200:
-    buy_reasons.append("Price ≥ SMA200")
-else:
-    buy_signal = False
-if rsi14 and rsi14 <= rsi_buy_max:
-    buy_reasons.append(f"RSI ≤ {rsi_buy_max}")
-else:
-    buy_signal = False
-if sent_norm >= 0.0:
-    buy_reasons.append("Sentiment ≥ Neutral")
-else:
-    buy_signal = False
-
-st.markdown("---")
-sig_col1, sig_col2 = st.columns([1,3])
-with sig_col1:
-    st.subheader("Signal")
-    st.success("✅ BUY CONDITIONS MET" if buy_signal else "⚠️ Conditions not met")
-with sig_col2:
-    st.write(", ".join(buy_reasons) if buy_reasons else "No positive conditions detected yet.")
-
-# ---------------- Tabs ----------------
-tab1, tab2, tab3, tab4 = st.tabs(["Score Breakdown", "DCF", "Sentiment (NLP)", "Institutional Ownership"])
-
-with tab1:
-    st.subheader("Score Breakdown")
-    bcols = st.columns(4)
-    bcols[0].metric("MOS (normalized)", f"{mos_norm:+.2f}")
-    bcols[1].metric("Sentiment (normalized)", f"{sent_norm:+.2f}", help="Weighted keywords from transcript/news")
-    bcols[2].metric("Technicals (normalized)", f"{tech_norm:+.2f}", help="SMA200 / RSI blend")
-    bcols[3].metric("Ownership (normalized)", f"{own_norm:+.2f}", help="QoQ institutional % change + concentration")
-
-    st.markdown("#### Quick Technicals — Price vs SMA200")
-    if quote.get("price_hist") is not None and not quote["price_hist"].empty:
-        hist = quote["price_hist"].reset_index()
-        sma200_series = hist["Close"].rolling(window=200, min_periods=100).mean()
-        chart = alt.Chart(hist).mark_line().encode(
-            x="Date:T",
-            y=alt.Y("Close:Q", title="Price")
-        ).properties(height=260)
-        chart_sma = alt.Chart(pd.DataFrame({"Date": hist["Date"], "SMA200": sma200_series})).mark_line().encode(
-            x="Date:T",
-            y=alt.Y("SMA200:Q", title="SMA200")
-        )
-        st.altair_chart(chart + chart_sma, use_container_width=True)
-
-        # RSI mini-chart
-        st.markdown("#### RSI(14)")
-        rsi_series = rsi(hist["Close"])
-        rsi_df = pd.DataFrame({"Date": hist["Date"], "RSI14": rsi_series})
-        line = alt.Chart(rsi_df).mark_line().encode(
-            x="Date:T",
-            y=alt.Y("RSI14:Q", title="RSI (0–100)", scale=alt.Scale(domain=[0, 100]))
-        ).properties(height=160)
-        st.altair_chart(line, use_container_width=True)
-        st.caption("Common levels: 30 (oversold), 70 (overbought).")
+def last_update_badge():
+    ts = st.session_state.last_fetch_utc
+    if ts:
+        st.caption(f"Last updated (UTC): **{ts.strftime('%Y-%m-%d %H:%M:%S')}**")
     else:
-        st.info("No price history available.")
+        st.caption("No data loaded yet. Click **Fetch latest data** in the sidebar.")
 
-with tab2:
-    st.subheader("Discounted Cash Flow (simplified)")
-    if dcf.get("ok"):
-        st.write(f"**Intrinsic Value per Share:** `{iv_ps:.2f}`")
-        st.caption("This simplified DCF uses trailing FCF (OCF - CapEx), projected growth for N years, a discount rate, and a terminal growth model.")
+# ----------------------------
+# Cached Quotes Helper (import)
+# Ensure src/data/quotes.py defines:
+#   @st.cache_data(ttl=900)
+#   def get_quotes(tickers: Sequence[str], period="1d", interval="1m"): ...
+# ----------------------------
+from src.data.quotes import get_quotes  # noqa: E402
+
+def fetch_and_store(tickers: Sequence[str]):
+    """Fetch quotes once (cached), store in session state."""
+    if not tickers:
+        st.warning("Please enter at least one ticker.")
+        return
+    try:
+        df = get_quotes(tickers, period="1d", interval="1m")
+        if df is None or (hasattr(df, "empty") and df.empty):
+            st.warning("No data returned for the selected tickers. Try again in a minute.")
+            return
+        st.session_state.quotes_df = df
+        st.session_state.last_fetch_utc = datetime.utcnow()
+    except Exception as e:
+        st.error(f"Failed to fetch data: {e}")
+
+# ----------------------------
+# Trigger fetches
+# ----------------------------
+tickers = parse_tickers(tickers_input)
+
+if refresh_now or st.session_state.quotes_df is None:
+    fetch_and_store(tickers)
+
+if auto_refresh and st.session_state.last_fetch_utc:
+    due = st.session_state.last_fetch_utc + timedelta(minutes=interval_min)
+    if datetime.utcnow() >= due:
+        fetch_and_store(tickers)
+        # Only re-run at most once per interval
+        st.rerun()
+
+quotes_df: Optional[pd.DataFrame] = st.session_state.quotes_df
+
+# ----------------------------
+# Tabs
+# ----------------------------
+tab_overview, tab_dcf, tab_ownership = st.tabs(["Overview", "DCF", "Ownership"])
+
+# ----------------------------
+# Overview Tab
+# ----------------------------
+with tab_overview:
+    st.subheader("Price Overview")
+    last_update_badge()
+
+    if quotes_df is None or (hasattr(quotes_df, "empty") and quotes_df.empty):
+        st.info("No data yet. Click **Fetch latest data** in the sidebar.")
     else:
-        st.warning(dcf.get("message", "DCF not available."))
+        # yfinance with group_by="ticker" often returns a MultiIndex for multiple tickers
+        try:
+            if isinstance(quotes_df.columns, pd.MultiIndex):
+                latest = {}
+                for t in tickers:
+                    try:
+                        close_series = quotes_df[(t, "Close")]
+                        if close_series is not None and not close_series.empty:
+                            latest[t] = float(close_series.dropna().iloc[-1])
+                    except Exception:
+                        continue
+                if latest:
+                    table = pd.DataFrame.from_dict(latest, orient="index", columns=["Last Close"])
+                    table.index.name = "Ticker"
+                    st.dataframe(table, use_container_width=True)
+                else:
+                    st.warning("Could not parse quote data. Try a manual refresh.")
+            else:
+                # Single-ticker shape
+                last_close = float(quotes_df["Close"].dropna().iloc[-1])
+                if tickers:
+                    st.metric(label=f"{tickers[0]} Last Close", value=f"{last_close:,.2f}")
+                else:
+                    st.metric(label="Last Close", value=f"{last_close:,.2f}")
+        except Exception as e:
+            st.warning(f"Overview rendering issue: {e}")
 
-with tab3:
-    st.subheader("NLP Sentiment on Latest Earnings")
-    st.write(f"**Label:** `{sent.get('label', 'neutral')}` — **Score:** `{sent_norm:+.2f}` (−1 to +1)")
-    if sent.get("hits"):
-        st.markdown("**Top Keyword Hits**")
-        st.dataframe(pd.DataFrame(sent["hits"]))
-    else:
-        st.info("Paste an earnings transcript or summary in the sidebar to analyze.")
-    st.caption("Tip: Paste the most recent call transcript or summary text in the sidebar to get a sharper reading.")
-
-with tab4:
-    st.subheader("Institutional Ownership")
-    if own.get("inst_pct") is not None:
-        met_cols = st.columns(4)
-        met_cols[0].metric("Institutional Ownership", f"{own['inst_pct']:.2f}%")
-        if own.get("qoq_change") is not None:
-            met_cols[1].metric("QoQ Change (approx.)", f"{own['qoq_change']:+.2f}pp")
+        st.divider()
+        if lite_mode:
+            st.write(
+                "Charts intentionally minimized in Lite mode to keep resource use low on Community Cloud."
+            )
         else:
-            met_cols[1].metric("QoQ Change (approx.)", "—")
-        met_cols[2].metric("Top 5 Concentration", f"{own['top5_pct']:.1f}%" if own.get("top5_pct") is not None else "—")
-        met_cols[3].metric("Top 10 Concentration", f"{own['top10_pct']:.1f}%" if own.get("top10_pct") is not None else "—")
+            st.write("Charts coming soon (ensure heavy plotting only runs after manual refresh).")
 
-        # Trend sparkline
-        trend_df = own.get("trend_df")
-        if trend_df is not None and not trend_df.empty:
-            st.markdown("**Institutional % Trend (cached snapshots)**")
-            tdf = trend_df.copy()
-            tdf = tdf.dropna(subset=["inst_pct"])
-            line = alt.Chart(tdf).mark_line().encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("inst_pct:Q", title="Institutional %")
-            ).properties(height=220)
-            st.altair_chart(line, use_container_width=True)
-        else:
-            st.info("No trend history yet. Each refresh writes a new snapshot for trend building.")
+# ----------------------------
+# DCF Tab (Illustrative placeholder)
+# ----------------------------
+with tab_dcf:
+    st.subheader("DCF Snapshot (Illustrative)")
+    last_update_badge()
 
-        # Top holders table
-        holders = own.get("holders")
-        if holders is not None and not holders.empty:
-            st.markdown("**Top Institutional Holders (by shares)**")
-            st.dataframe(holders.head(20))
-        else:
-            st.info("Holder breakdown unavailable.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        selected = st.selectbox("Ticker", options=tickers or ["—"], index=0 if tickers else 0)
+    with c2:
+        wacc = st.number_input("WACC %", min_value=4.0, max_value=20.0, value=10.0, step=0.5)
+    with c3:
+        mos = st.slider("Margin of Safety %", 0, 50, 20)
 
-        # Change commentary
-        if own.get("top10_changes"):
-            st.caption(own.get("top10_changes"))
+    if quotes_df is None or (hasattr(quotes_df, "empty") and quotes_df.empty) or selected == "—":
+        st.info("Load quotes and choose a ticker to see a simple, illustrative DCF anchor.")
     else:
-        st.warning(own.get("message", "Institutional data not available."))
+        # Pull a rough price anchor from the latest close
+        try:
+            if isinstance(quotes_df.columns, pd.MultiIndex):
+                px = float(quotes_df[(selected, "Close")].dropna().iloc[-1])
+            else:
+                px = float(quotes_df["Close"].dropna().iloc[-1])
+        except Exception:
+            px = math.nan
 
-st.markdown("---")
-st.caption("OmArtificial Gains: composite score = 40% MOS, 25% Sentiment, 20% Technicals, 15% Ownership.")
+        if not math.isnan(px):
+            # Illustrative intrinsic value (placeholder logic)
+            base_iv = px * (1 + (12.0 - (wacc - 10.0)) / 100.0)
+            iv = max(base_iv, 0.01)
+            target_buy = iv * (1 - mos / 100)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Price (approx.)", f"${px:,.2f}")
+            m2.metric("Intrinsic Value (toy)", f"${iv:,.2f}")
+            m3.metric("Buy Below (MOS applied)", f"${target_buy:,.2f}")
+
+            st.caption(
+                "Placeholder DCF. Plug in your full fundamentals-based DCF here (cache those calls too)."
+            )
+        else:
+            st.warning("Could not compute a price anchor from quotes.")
+
+# ----------------------------
+# Ownership Tab (Preview)
+# ----------------------------
+with tab_ownership:
+    st.subheader("Institutional Ownership (Preview)")
+    st.info(
+        "Live ownership lookups are disabled to respect fair-use. "
+        "When you add them, wrap network calls with `@st.cache_data(ttl=900)` and fetch only on button click."
+    )
+    st.write(
+        "Planned fields: % held by institutions, QoQ change, net shares added/trimmed, top holder changes, "
+        "concentration (% top 5/10), and a small trend sparkline."
+    )
+
+# ----------------------------
+# Footer
+# ----------------------------
+st.divider()
+st.caption(
+    "Built for Community Cloud. If you hit a 403 again, wait for the limit to reset, "
+    "then keep refresh manual and caching enabled."
+)
+
