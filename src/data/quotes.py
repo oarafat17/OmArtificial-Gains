@@ -1,338 +1,217 @@
+# streamlit_app.py
+# OmArtificial Gains – Fair-Use Friendly Build
+# - Manual refresh button (no background polling)
+# - Cached data fetches (handled in src/data/quotes.py)
+# - Gentle, optional auto-refresh (OFF by default)
+# - “Lite mode” to avoid heavy calls on Community Cloud
+
 from __future__ import annotations
+
 import math
+from datetime import datetime, timedelta
+from typing import List, Sequence
+
 import pandas as pd
-import numpy as np
-import yfinance as yf
+import streamlit as st
 
-# ----------------------------
-# Price & History Helpers
-# ----------------------------
+# ---- App Config ----
+st.set_page_config(
+    page_title="OmArtificial Gains",
+    page_icon="📈",
+    layout="wide",
+)
 
-def _safe_float(x):
+st.title("OmArtificial Gains 📈")
+st.caption(
+    "Fair-use friendly build. Data is cached and only refreshed on demand to avoid Streamlit Cloud 403 blocks."
+)
+
+# ---- Sidebar: Tickers & Mode ----
+st.sidebar.header("Configuration")
+
+tickers_input = st.sidebar.text_input(
+    "Tickers (comma-separated)",
+    value="AAPL, MSFT, NVDA",
+    help="Example: AAPL, MSFT, NVDA",
+)
+
+# Keep things light by default on Community Cloud
+lite_mode = st.sidebar.toggle(
+    "Lite mode (recommended on Streamlit Cloud)",
+    value=True,
+    help="Skips non-essential network work."
+)
+
+# ---- Sidebar: Refresh Controls (Step 2 lives here) ----
+st.sidebar.subheader("Data refresh")
+
+# Manual refresh only; gentle auto-refresh is optional and disabled by default
+refresh_now = st.sidebar.button("Fetch latest data")
+st.sidebar.caption("Tip: Data is cached ~15 minutes in Community Cloud friendly mode.")
+
+auto_refresh = st.sidebar.toggle("Auto-refresh (advanced)", value=False)
+interval_min = st.sidebar.slider(
+    "Auto-refresh interval (minutes)",
+    min_value=10, max_value=60, value=15,
+    disabled=not auto_refresh
+)
+
+# ---- Utilities / Session State ----
+if "quotes_df" not in st.session_state:
+    st.session_state.quotes_df = None
+    st.session_state.last_fetch_utc = None
+
+def parse_tickers(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [t.strip().upper() for t in raw.split(",") if t.strip()]
+
+# ---- Data fetch (cached in src/data/quotes.py) ----
+# Make sure your src/data/quotes.py has the cached get_quotes() from earlier
+from src.data.quotes import get_quotes  # noqa: E402
+
+def fetch_and_store(tickers: Sequence[str]):
+    if not tickers:
+        st.warning("Please enter at least one ticker.")
+        return
     try:
-        v = float(x)
-        if math.isfinite(v):
-            return v
-    except Exception:
-        pass
-    return None
+        df = get_quotes(tickers, period="1d", interval="1m")
+        st.session_state.quotes_df = df
+        st.session_state.last_fetch_utc = datetime.utcnow()
+    except Exception as e:
+        st.error(f"Failed to fetch data: {e}")
+        return
 
-def get_price_history(ticker: str, period: str = "3y", interval: str = "1d") -> pd.DataFrame:
-    """
-    Fetches price history with a fallback if Yahoo returns an empty frame.
-    """
-    t = yf.Ticker(ticker)
-    hist = t.history(period=period, interval=interval, auto_adjust=True)
-    if hist is None or hist.empty:
-        # Fallback: shorter window to improve odds if Yahoo throttled long lookbacks
-        hist = t.history(period="1y", interval=interval, auto_adjust=True)
-    if hist is None or hist.empty:
-        return pd.DataFrame()
-    hist = hist.rename(columns=str.capitalize)  # Close, Open, etc.
-    return hist
+# ---- Trigger fetches ----
+tickers = parse_tickers(tickers_input)
 
-def sma(series: pd.Series, window: int = 200) -> pd.Series:
-    if series is None or series.empty:
-        return pd.Series(dtype=float)
-    return series.rolling(window=window, min_periods=max(1, window // 2)).mean()
+if refresh_now or st.session_state.quotes_df is None:
+    fetch_and_store(tickers)
 
-def rsi(prices: pd.Series, period: int = 14) -> pd.Series:
-    if prices is None or prices.empty:
-        return pd.Series(dtype=float)
-    delta = prices.diff()
-    up = delta.clip(lower=0.0)
-    down = -1 * delta.clip(upper=0.0)
-    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    rsi_vals = 100.0 - (100.0 / (1.0 + rs))
-    return rsi_vals
+if auto_refresh and st.session_state.last_fetch_utc:
+    due = st.session_state.last_fetch_utc + timedelta(minutes=interval_min)
+    if datetime.utcnow() >= due:
+        fetch_and_store(tickers)
+        # Only re-run at most once per interval
+        st.rerun()
 
-def _try_fast_info_price(t: yf.Ticker):
-    """
-    Try multiple fast_info keys that sometimes vary by yfinance version.
-    """
-    price = None
-    fi = getattr(t, "fast_info", None)
-    if isinstance(fi, dict):
-        for key in ("last_price", "lastPrice", "regularMarketPrice", "previous_close", "previousClose"):
-            if key in fi:
-                price = _safe_float(fi.get(key))
-                if price is not None:
-                    return price
-    # Some versions return a SimpleNamespace-like object
-    if fi is not None and not isinstance(fi, dict):
-        for key in ("last_price", "lastPrice", "regularMarketPrice", "previous_close", "previousClose"):
-            if hasattr(fi, key):
-                price = _safe_float(getattr(fi, key))
-                if price is not None:
-                    return price
-    return None
+quotes_df = st.session_state.quotes_df
 
-def _try_history_price(t: yf.Ticker):
-    """
-    Use intraday and daily history to get the latest price.
-    """
-    # 1m interval, same day
-    try:
-        h1 = t.history(period="1d", interval="1m", auto_adjust=True)
-        if h1 is not None and not h1.empty and "Close" in h1.columns:
-            p = _safe_float(h1["Close"].iloc[-1])
-            if p is not None:
-                return p
-    except Exception:
-        pass
+# ---- Helper: Last update badge ----
+def last_update_badge():
+    ts = st.session_state.last_fetch_utc
+    if ts:
+        st.caption(f"Last updated (UTC): **{ts.strftime('%Y-%m-%d %H:%M:%S')}**")
+    else:
+        st.caption("No data loaded yet. Click **Fetch latest data** above.")
 
-    # 1d close from 5d history
-    try:
-        h2 = t.history(period="5d", interval="1d", auto_adjust=True)
-        if h2 is not None and not h2.empty and "Close" in h2.columns:
-            p = _safe_float(h2["Close"].iloc[-1])
-            if p is not None:
-                return p
-    except Exception:
-        pass
+# ---- Tabs ----
+tab_overview, tab_dcf, tab_ownership = st.tabs(["Overview", "DCF", "Ownership"])
 
-    # 1d close
-    try:
-        h3 = t.history(period="1d", interval="1d", auto_adjust=True)
-        if h3 is not None and not h3.empty and "Close" in h3.columns:
-            p = _safe_float(h3["Close"].iloc[-1])
-            if p is not None:
-                return p
-    except Exception:
-        pass
+# -------------------------
+# Overview Tab
+# -------------------------
+with tab_overview:
+    st.subheader("Price Overview")
+    last_update_badge()
 
-    return None
-
-def _try_info_price(t: yf.Ticker):
-    """
-    Deprecated .info can still work as a fallback on some installs.
-    """
-    try:
-        gi = t.get_info()
-        for key in ("currentPrice", "regularMarketPrice", "previousClose"):
-            if key in gi:
-                p = _safe_float(gi.get(key))
-                if p is not None:
-                    return p
-    except Exception:
-        pass
-    return None
-
-def get_current_price(ticker: str) -> float | None:
-    """
-    Resilient current price across yfinance versions and Yahoo quirks.
-    """
-    t = yf.Ticker(ticker)
-    # 1) fast_info
-    p = _try_fast_info_price(t)
-    if p is not None:
-        return p
-    # 2) history-based approaches
-    p = _try_history_price(t)
-    if p is not None:
-        return p
-    # 3) legacy info fallback
-    p = _try_info_price(t)
-    if p is not None:
-        return p
-    return None
-
-# ----------------------------
-# Public API for the app
-# ----------------------------
-
-def get_quote_summary(ticker: str) -> dict:
-    t = yf.Ticker(ticker)
-
-    price = get_current_price(ticker)
-    prev_close = None
-    market_cap = None
-    shares_out = None
-
-    # Try to fetch some fast_info facts if present
-    fi = getattr(t, "fast_info", None)
-    if isinstance(fi, dict):
-        prev_close = _safe_float(fi.get("previous_close") or fi.get("previousClose"))
-        market_cap = _safe_float(fi.get("market_cap") or fi.get("marketCap"))
-    elif fi is not None and not isinstance(fi, dict):
-        prev_close = _safe_float(getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None))
-        market_cap = _safe_float(getattr(fi, "market_cap", None) or getattr(fi, "marketCap", None))
-
-    # Fallback to get_info if needed
-    if market_cap is None or prev_close is None:
+    if quotes_df is None or quotes_df.empty:
+        st.info("No data yet. Click **Fetch latest data** in the sidebar.")
+    else:
+        # yfinance group_by="ticker" returns a multi-index when multiple tickers are requested.
+        # Try to present a simple latest price table.
         try:
-            gi = t.get_info()
-            if market_cap is None:
-                market_cap = _safe_float(gi.get("marketCap"))
-            if prev_close is None:
-                prev_close = _safe_float(gi.get("previousClose"))
-        except Exception:
-            pass
+            if isinstance(quotes_df.columns, pd.MultiIndex):
+                latest = {}
+                for t in tickers:
+                    # Robustly extract last close for each ticker
+                    try:
+                        close_series = quotes_df[(t, "Close")]
+                        latest[t] = float(close_series.dropna().iloc[-1])
+                    except Exception:
+                        continue
+                if latest:
+                    table = pd.DataFrame.from_dict(latest, orient="index", columns=["Last Close"])
+                    table.index.name = "Ticker"
+                    st.dataframe(table, use_container_width=True)
+                else:
+                    st.warning("Could not parse quote data. Try a manual refresh.")
+            else:
+                # Single-ticker shape
+                last_close = float(quotes_df["Close"].dropna().iloc[-1])
+                st.metric(label=f"{tickers[0]} Last Close", value=f"{last_close:,.2f}")
+        except Exception as e:
+            st.warning(f"Overview rendering issue: {e}")
 
-    # Shares outstanding
-    try:
-        gi = t.get_info()
-        shares_out = gi.get("sharesOutstanding")
-        if (shares_out is None) and market_cap and price and price > 0:
-            shares_out = int(market_cap / price)
-    except Exception:
-        if market_cap and price and price > 0:
-            shares_out = int(market_cap / price)
+        st.divider()
+        st.write(
+            "Charts intentionally omitted in Lite mode to minimize resource use on Community Cloud."
+        )
 
-    # History + indicators
-    hist = get_price_history(ticker, period="3y", interval="1d")
-    sma200_val = float(sma(hist["Close"], 200).iloc[-1]) if not hist.empty and len(hist) >= 100 else None
-    rsi14_val = float(rsi(hist["Close"], 14).iloc[-1]) if not hist.empty and len(hist) >= 20 else None
+# -------------------------
+# DCF Tab
+# -------------------------
+with tab_dcf:
+    st.subheader("DCF Snapshot (Illustrative)")
+    last_update_badge()
 
-    return {
-        "price": price,
-        "prev_close": prev_close,
-        "market_cap": market_cap,
-        "shares_outstanding": shares_out,
-        "sma200": sma200_val,
-        "rsi14": rsi14_val,
-        "price_hist": hist
-    }
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        selected = st.selectbox("Ticker", options=tickers or ["—"], index=0 if tickers else 0)
+    with col2:
+        wacc = st.number_input("WACC %", min_value=4.0, max_value=20.0, value=10.0, step=0.5)
+    with col3:
+        mos = st.slider("Margin of Safety %", 0, 50, 20)
 
-# ----------------------------
-# DCF & Profitability Utilities
-# ----------------------------
-
-def recent_fcf_annual(ticker: str) -> float | None:
-    """
-    Approximate trailing 12-month FCF using yfinance statements:
-    FCF = Operating Cash Flow - CapEx.
-    Try TTM (quarterly sum) first, else last annual.
-    """
-    t = yf.Ticker(ticker)
-    fcf_ttm = None
-
-    try:
-        cf_q = t.quarterly_cashflow
-        if cf_q is not None and not cf_q.empty:
-            ocf = cf_q.loc["Operating Cash Flow"].dropna().head(4).sum()
-            capex = cf_q.loc["Capital Expenditures"].dropna().head(4).sum()
-            fcf_ttm = float(ocf - capex)
-    except Exception:
-        pass
-
-    if fcf_ttm is not None and np.isfinite(fcf_ttm):
-        return fcf_ttm
-
-    try:
-        cf_a = t.cashflow
-        if cf_a is not None and not cf_a.empty:
-            ocf = cf_a.loc["Operating Cash Flow"].dropna().iloc[0]
-            capex = cf_a.loc["Capital Expenditures"].dropna().iloc[0]
-            return float(ocf - capex)
-    except Exception:
-        pass
-
-    return None
-
-def simple_dcf_intrinsic_value(
-    ticker: str,
-    fcf0: float | None = None,
-    shares_outstanding: int | None = None,
-    years: int = 5,
-    growth_rate: float = 0.08,
-    discount_rate: float = 0.11,
-    terminal_growth: float = 0.025,
-) -> dict:
-    """
-    Basic DCF using a single-stage growth then terminal value (Gordon).
-    Returns per-share intrinsic value and status message.
-    """
-    t = yf.Ticker(ticker)
-    if fcf0 is None:
-        fcf0 = recent_fcf_annual(ticker)
-
-    if shares_outstanding is None:
+    # Lightweight illustrative DCF using a single price anchor if present.
+    if quotes_df is None or quotes_df.empty or selected == "—":
+        st.info("Load quotes and choose a ticker to see a simple, illustrative DCF anchor.")
+    else:
+        # Pull a very rough 'price' anchor from the latest close
         try:
-            gi = t.get_info()
-            shares_outstanding = gi.get("sharesOutstanding")
+            if isinstance(quotes_df.columns, pd.MultiIndex):
+                px = float(quotes_df[(selected, "Close")].dropna().iloc[-1])
+            else:
+                px = float(quotes_df["Close"].dropna().iloc[-1])
         except Exception:
-            pass
+            px = math.nan
 
-    if not fcf0 or not shares_outstanding or discount_rate <= terminal_growth:
-        return {
-            "ok": False,
-            "message": "Insufficient data for DCF (FCF, shares, or rates).",
-            "iv_per_share": None
-        }
+        if not math.isnan(px):
+            # Illustrative intrinsic value (NOT investment advice)
+            # Assume a modest growth premium over price; adjust by WACC.
+            base_iv = px * (1 + (12.0 - (wacc - 10.0)) / 100.0)
+            iv = max(base_iv, 0.01)
+            target_buy = iv * (1 - mos / 100)
 
-    # Project FCF for N years
-    fcf_list = []
-    fcf = float(fcf0)
-    for _ in range(years):
-        fcf *= (1.0 + growth_rate)
-        fcf_list.append(fcf)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Price (approx.)", f"${px:,.2f}")
+            c2.metric("Intrinsic Value (toy model)", f"${iv:,.2f}")
+            c3.metric("Buy Below (with MOS)", f"${target_buy:,.2f}")
 
-    # Discount each year
-    disc = [(fcf_list[i] / ((1.0 + discount_rate) ** (i+1))) for i in range(years)]
-    pv_sum = sum(disc)
+            st.caption(
+                "This is a **placeholder** DCF anchor. Your full DCF logic with MOS slider and scorecard "
+                "can plug in here once fundamentals are fetched (cache those calls too)."
+            )
+        else:
+            st.warning("Could not compute a price anchor from quotes.")
 
-    # Terminal value at year N
-    tv = fcf_list[-1] * (1.0 + terminal_growth) / (discount_rate - terminal_growth)
-    pv_tv = tv / ((1.0 + discount_rate) ** years)
+# -------------------------
+# Ownership Tab
+# -------------------------
+with tab_ownership:
+    st.subheader("Institutional Ownership (Preview)")
+    st.info(
+        "To respect fair-use, live ownership lookups are disabled in this build. "
+        "When you add them, wrap network calls with `@st.cache_data(ttl=900)` and fetch only on button click."
+    )
+    st.write(
+        "Planned fields: current % held by institutions, QoQ change, net shares added/trimmed, "
+        "top holder changes, concentration (% top 5/10), small trend sparkline."
+    )
 
-    enterprise = pv_sum + pv_tv
-    iv_per_share = enterprise / float(shares_outstanding)
-
-    return {
-        "ok": True,
-        "message": "DCF calculated",
-        "iv_per_share": float(iv_per_share)
-    }
-
-def get_profitability_flags(ticker: str) -> dict:
-    """
-    Returns booleans and latest values for:
-      - net_profit: whether Net Income (TTM approx or last annual) > 0
-      - ocf_positive: Operating Cash Flow TTM > 0
-      - fcf_positive: Free Cash Flow TTM > 0 (OCF - CapEx)
-    """
-    t = yf.Ticker(ticker)
-    net_income_val = None
-    ocf_ttm = None
-    capex_ttm = None
-    fcf_ttm = None
-
-    # Net income (try TTM via 4 recent quarterlies; else last annual)
-    try:
-        inc_q = t.quarterly_income_stmt
-        if inc_q is not None and not inc_q.empty and "Net Income" in inc_q.index:
-            net_income_val = float(inc_q.loc["Net Income"].dropna().head(4).sum())
-    except Exception:
-        pass
-    if net_income_val is None:
-        try:
-            inc_a = t.income_stmt
-            if inc_a is not None and not inc_a.empty and "Net Income" in inc_a.index:
-                net_income_val = float(inc_a.loc["Net Income"].dropna().iloc[0])
-        except Exception:
-            pass
-
-    # OCF / CapEx TTM
-    try:
-        cf_q = t.quarterly_cashflow
-        if cf_q is not None and not cf_q.empty:
-            ocf_ttm = float(cf_q.loc["Operating Cash Flow"].dropna().head(4).sum())
-            capex_ttm = float(cf_q.loc["Capital Expenditures"].dropna().head(4).sum())
-            fcf_ttm = ocf_ttm - capex_ttm
-    except Exception:
-        pass
-
-    return {
-        "net_profit": (net_income_val is not None and net_income_val > 0),
-        "ocf_positive": (ocf_ttm is not None and ocf_ttm > 0),
-        "fcf_positive": (fcf_ttm is not None and fcf_ttm > 0),
-        "values": {
-            "net_income_ttm_or_annual": net_income_val,
-            "ocf_ttm": ocf_ttm,
-            "capex_ttm": capex_ttm,
-            "fcf_ttm": fcf_ttm,
-        }
-    }
+# ---- Footer ----
+st.divider()
+st.caption(
+    "Built for Community Cloud. If you hit a 403 again, wait for the limit to reset, "
+    "then keep refresh manual and caching enabled."
+)
